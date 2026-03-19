@@ -1,125 +1,87 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.base import clone
-from catboost import CatBoostClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV
 
 # ======================
-# 1. 数据读取与初步合并
+# 1. 极简数据读取
 # ======================
 train = pd.read_csv("train.csv")
 test = pd.read_csv("test.csv")
-n_train = len(train)
 full = pd.concat([train, test], sort=False).reset_index(drop=True)
 
 # ======================
-# 2. 核心特征工程：生存组挖掘
+# 2. 核心特征工程（精简版
 # ======================
-# 提取姓氏
+# 提取头衔
+full['Title'] = full['Name'].str.extract(' ([A-Za-z]+)\.', expand=False)
+full['Title'] = full['Title'].replace(['Lady', 'Countess','Capt', 'Col','Don', 'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer', 'Dona'], 'Rare')
+full['Title'] = full['Title'].replace('Mlle', 'Miss')
+full['Title'] = full['Title'].replace('Ms', 'Miss')
+full['Title'] = full['Title'].replace('Mme', 'Mrs')
+
+# 填补缺失值
+full['FamilySize'] = full['SibSp'] + full['Parch'] + 1
+full['Fare'] = full['Fare'].fillna(full['Fare'].median())
+# 年龄用 Sex, Pclass, Title 的中位数填补
+full['Age'] = full.groupby(['Sex', 'Pclass', 'Title'])['Age'].transform(lambda x: x.fillna(x.median()))
+
+# 关键：提取姓氏（用于发现家庭组）
 full['Surname'] = full['Name'].apply(lambda x: x.split(',')[0])
 
-# 定义“妇女和儿童”组 (泰坦尼克号核心生存逻辑)
-# 寻找同一姓氏或同一客票号的群体
-full['WomanChild'] = ((full['Sex'] == 'female') | (full['Age'] <= 12)).astype(int)
-family_groups = full.groupby('Surname')['Survived'].mean()
-ticket_groups = full.groupby('Ticket')['Survived'].mean()
+# ======================
+# 3.Woman-Child-Group
+# ======================
+# 我们只看妇女和儿童（Master）
+full['IsWomanOrChild'] = ((full['Sex'] == 'female') | (full['Title'] == 'Master')).astype(int)
 
-# 创建特征：如果同组人中有人遇难/生存，会极大影响该成员的预测
-full['FamilySurv'] = full['Surname'].map(family_groups).fillna(0.5)
-full['TicketSurv'] = full['Ticket'].map(ticket_groups).fillna(0.5)
-full['GroupSurvival'] = (full['FamilySurv'] + full['TicketSurv']) / 2
+# 建立家庭生存参考
+# 在训练集中，计算每个姓氏的生存情况
+family_survival = full.iloc[:891].groupby('Surname')['Survived'].mean()
+full['FamilySurv'] = full['Surname'].map(family_survival).fillna(0.5)
+
+# 如果这个家庭里有人死了，那么这个组里的其他人也很危险
+# 如果这个家庭里有人活了，那么这个组里的其他人也很安全
+# 只给妇女和儿童应用这个逻辑
+full['GroupHazard'] = 0.5
+full.loc[(full['IsWomanOrChild'] == 1) & (full['FamilySurv'] == 0), 'GroupHazard'] = 0
+full.loc[(full['IsWomanOrChild'] == 1) & (full['FamilySurv'] == 1), 'GroupHazard'] = 1
 
 # ======================
-# 3. 基础特征提取
+# 4. 准备训练
 # ======================
-full['Title'] = full['Name'].str.extract(' ([A-Za-z]+)\.', expand=False)
-title_dict = {
-    "Capt": "Officer", "Col": "Officer", "Major": "Officer", "Jonkheer": "Royalty",
-    "Don": "Royalty", "Sir": "Royalty", "Dr": "Officer", "Rev": "Officer",
-    "Countess": "Royalty", "Mme": "Mrs", "Mlle": "Miss", "Ms": "Mrs",
-    "Mr": "Mr", "Mrs": "Mrs", "Miss": "Miss", "Master": "Master", "Lady": "Royalty"
-}
-full['Title'] = full['Title'].map(title_dict)
+# 编码
+full['Sex'] = full['Sex'].map({'male': 0, 'female': 1})
+full['Embarked'] = full['Embarked'].fillna('S').map({'S': 0, 'C': 1, 'Q': 2})
+title_mapping = {"Mr": 1, "Miss": 2, "Mrs": 3, "Master": 4, "Rare": 5}
+full['Title'] = full['Title'].map(title_mapping)
 
-full['FamilySize'] = full['SibSp'] + full['Parch'] + 1
-full['IsAlone'] = (full['FamilySize'] == 1).astype(int)
-full['Embarked'] = full['Embarked'].fillna('S')
-full['Fare'] = full['Fare'].fillna(full['Fare'].median())
+features = ['Pclass', 'Sex', 'Age', 'Fare', 'Title', 'FamilySize', 'GroupHazard']
+
+X = full.iloc[:891][features]
+y = train['Survived']
+X_test = full.iloc[891:][features]
 
 # ======================
-# 4. 预测填充缺失年龄 (比中位数better)
+# 5. 使用一个极其稳健的随机森林
 # ======================
-age_features = ['Pclass', 'Sex', 'Title', 'SibSp', 'Parch', 'Fare']
-age_df = full[['Age'] + age_features].copy()
-age_df['Sex'] = LabelEncoder().fit_transform(age_df['Sex'])
-age_df['Title'] = LabelEncoder().fit_transform(age_df['Title'].astype(str))
+model = RandomForestClassifier(
+    n_estimators=100,
+    max_depth=5,        # 严格限制深度，防止它学坏
+    min_samples_split=10,
+    min_samples_leaf=5,
+    random_state=42
+)
 
-train_age = age_df[age_df['Age'].notnull()]
-test_age = age_df[age_df['Age'].isnull()]
-
-if not test_age.empty:
-    rf_age = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf_age.fit(train_age.drop('Age', axis=1), train_age['Age'])
-    full.loc[full['Age'].isnull(), 'Age'] = rf_age.predict(test_age.drop('Age', axis=1))
+model.fit(X, y)
 
 # ======================
-# 5. 编码与准备
+# 6. 生成提交
 # ======================
-for col in ['Sex', 'Embarked', 'Title']:
-    full[col] = LabelEncoder().fit_transform(full[col])
+predictions = model.predict(X_test)
 
-# 选择精选特征
-features = ['Pclass', 'Sex', 'Age', 'Fare', 'Embarked', 'Title',
-            'FamilySize', 'GroupSurvival', 'IsAlone']
-
-X = full.iloc[:n_train][features].values
-y = train['Survived'].values
-X_test = full.iloc[n_train:][features].values
-
-# 标准化
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-X_test_scaled = scaler.transform(X_test)
-
-# ======================
-# 6. 模型调参与加权融合
-# ======================
-# 调整后的模型参数，注重抗过拟合
-models = [
-    ('LR', LogisticRegression(C=0.1, max_iter=1000), True),
-    ('RF', RandomForestClassifier(n_estimators=500, max_depth=6, min_samples_leaf=2, random_state=42), False),
-    ('GB', GradientBoostingClassifier(n_estimators=300, learning_rate=0.05, max_depth=3, random_state=42), False),
-    ('CB', CatBoostClassifier(iterations=500, learning_rate=0.03, depth=6, verbose=0, random_state=42), False)
-]
-
-kf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)  # 增加到10折
-final_preds = np.zeros(len(X_test))
-
-for name, model_obj, use_scaled in models:
-    print(f"训练 {name}...")
-    fold_preds = np.zeros(len(X_test))
-
-    for train_idx, val_idx in kf.split(X, y):
-        xt, xv = (X_scaled[train_idx], X_scaled[val_idx]) if use_scaled else (X[train_idx], X[val_idx])
-        yt, yv = y[train_idx], y[val_idx]
-
-        m = clone(model_obj)
-        m.fit(xt, yt)
-        fold_preds += m.predict_proba(X_test_scaled if use_scaled else X_test)[:, 1] / kf.n_splits
-
-    # 给树模型（RF, CB）稍高的权重，逻辑回归稍低
-    weight = 0.3 if name in ['RF', 'CB'] else 0.2
-    final_preds += fold_preds * weight
-
-# ======================
-# 7. 生成提交
-# ======================
 submission = pd.DataFrame({
     "PassengerId": test["PassengerId"],
-    "Survived": (final_preds > 0.5).astype(int)
+    "Survived": predictions
 })
-submission.to_csv("submission_survive.csv", index=False)
-print("策略：生存组挖掘 + 随机森林补年龄 + 10折加权融合")
+submission.to_csv("submission_final.csv", index=False)
